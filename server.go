@@ -100,7 +100,7 @@ func StartServer() {
 		}
 		utils.Log.Info("Client order decoded", zap.Any("data", o))
 
-		atomic.AddInt64(&domain.OrderId, 1)
+		oId := atomic.AddInt64(&domain.OrderId, 1)
 
 		var orders = make([]domain.ClientOrderResponse, 0)
 		for i := 0; i < len(o.Orders); i++ {
@@ -112,12 +112,32 @@ func StartServer() {
 				CreatedTime: o.Orders[i].CreatedTime,
 			}
 
-			body, _ := json.Marshal(toRestaurant)
-			resp, _ := http.Post(domain.RestaurantsMenu.RestaurantsData[o.Orders[i].RestaurantId-1].Address+"/v2/order", "application/json", bytes.NewBuffer(body))
+			utils.Log.Info("Send order to restaurant", zap.Any("data", toRestaurant))
+
+			body, err := json.Marshal(toRestaurant)
+
+			if err != nil {
+				utils.Log.Fatal("Failed to convert restaurant order to json", zap.String("error", err.Error()), zap.Any("order", toRestaurant))
+			}
+
+			resp, err := http.Post(domain.RestaurantsMenu.RestaurantsData[o.Orders[i].RestaurantId-1].Address+"/v2/order", "application/json", bytes.NewBuffer(body))
+
+			if err != nil {
+				utils.Log.Warn("Failed to send order to restaurant, retrying", zap.String("error", err.Error()), zap.Any("order", toRestaurant))
+				resp, err = http.Post(domain.RestaurantsMenu.RestaurantsData[o.Orders[i].RestaurantId-1].Address+"/v2/order", "application/json", bytes.NewBuffer(body))
+				if err != nil {
+					utils.Log.Fatal("Failed to send order to restaurant", zap.String("error", err.Error()), zap.Any("order", toRestaurant))
+
+				}
+			}
+
+			utils.Log.Info("restaurant response", zap.Any("data", resp))
 
 			var ord domain.RestaurantOrderResponse
 
 			json.NewDecoder(resp.Body).Decode(&ord)
+
+			utils.Log.Info("create response for", zap.Any("data", ord))
 
 			order := domain.ClientOrderResponse{
 				RestaurantId:         ord.RestaurantId,
@@ -127,10 +147,13 @@ func StartServer() {
 				CreatedTime:          utils.GetCurrentTimeFloat(),
 				RegisteredTime:       ord.RegisteredTime,
 			}
+
+			utils.Log.Info("response created", zap.Any("data", order))
+
 			orders = append(orders, order)
 		}
 		responseObj := domain.ClientResponse{
-			OrderId: int(atomic.LoadInt64(&domain.OrderId)),
+			OrderId: int(oId),
 			Orders:  orders,
 		}
 
