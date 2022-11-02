@@ -3,8 +3,8 @@ package domain
 import "github.com/darkcat013/pr-food-ordering/utils"
 
 type Menu struct {
-	Restaurants     int              `json:"restaurants"`
-	RestaurantsData []RestaurantData `json:"restaurants_data"`
+	Restaurants     int                    `json:"restaurants"`
+	RestaurantsData map[int]RestaurantData `json:"restaurants_data"`
 }
 
 func RestaurantRegistrationsHandler() {
@@ -22,6 +22,6 @@ func RestaurantRegistrationsHandler() {
 			RegisteredTime: utils.GetCurrentTimeFloat(),
 		}
 
-		RestaurantsMenu.RestaurantsData = append(RestaurantsMenu.RestaurantsData, restaurantMenu)
+		RestaurantsMenu.RestaurantsData[rd.RestaurantId] = restaurantMenu
 	}
 }

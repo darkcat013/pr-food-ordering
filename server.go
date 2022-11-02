@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"sync"
 	"sync/atomic"
 
 	"github.com/darkcat013/pr-food-ordering/config"
@@ -103,7 +104,12 @@ func StartServer() {
 		oId := atomic.AddInt64(&domain.OrderId, 1)
 
 		var orders = make([]domain.ClientOrderResponse, 0)
+		var mu = &sync.Mutex{}
+		var wg = &sync.WaitGroup{}
+
 		for i := 0; i < len(o.Orders); i++ {
+
+			rAddr := domain.RestaurantsMenu.RestaurantsData[o.Orders[i].RestaurantId].Address
 
 			toRestaurant := domain.RestaurantOrderPayload{
 				Items:       o.Orders[i].Items,
@@ -111,63 +117,67 @@ func StartServer() {
 				MaxWait:     o.Orders[i].MaxWait,
 				CreatedTime: o.Orders[i].CreatedTime,
 			}
+			wg.Add(1)
 
-			utils.Log.Info("Send order to restaurant", zap.Any("data", toRestaurant))
+			go func(restaurantAddress string, payload domain.RestaurantOrderPayload) {
 
-			body, err := json.Marshal(toRestaurant)
+				utils.Log.Info("Send order to restaurant", zap.Any("data", payload))
 
-			if err != nil {
-				utils.Log.Fatal("Failed to convert restaurant order to json", zap.String("error", err.Error()), zap.Any("order", toRestaurant))
-			}
+				body, err := json.Marshal(payload)
 
-			resp, err := http.Post(domain.RestaurantsMenu.RestaurantsData[o.Orders[i].RestaurantId-1].Address+"/v2/order", "application/json", bytes.NewBuffer(body))
-
-			if err != nil {
-				utils.Log.Warn("Failed to send order to restaurant, retrying", zap.String("error", err.Error()), zap.Any("order", toRestaurant))
-				resp, err = http.Post(domain.RestaurantsMenu.RestaurantsData[o.Orders[i].RestaurantId-1].Address+"/v2/order", "application/json", bytes.NewBuffer(body))
 				if err != nil {
-					utils.Log.Fatal("Failed to send order to restaurant", zap.String("error", err.Error()), zap.Any("order", toRestaurant))
-
+					utils.Log.Fatal("Failed to convert restaurant order to json", zap.String("error", err.Error()), zap.Any("order", payload))
 				}
-			}
 
-			utils.Log.Info("restaurant response", zap.Any("data", resp))
+				resp, err := http.Post(restaurantAddress+"/v2/order", "application/json", bytes.NewBuffer(body))
+				if err != nil {
+					utils.Log.Error("Failed to send order to restaurant"+restaurantAddress, zap.String("error", err.Error()), zap.Any("order", payload))
+					http.Error(w, "Failed to send order to restaurant "+restaurantAddress, http.StatusBadRequest)
+				}
 
-			var ord domain.RestaurantOrderResponse
+				var ord domain.RestaurantOrderResponse
 
-			json.NewDecoder(resp.Body).Decode(&ord)
+				json.NewDecoder(resp.Body).Decode(&ord)
 
-			utils.Log.Info("create response for", zap.Any("data", ord))
+				utils.Log.Info("Decoded Restautant response", zap.Any("data", ord))
 
-			order := domain.ClientOrderResponse{
-				RestaurantId:         ord.RestaurantId,
-				RestaurantAddress:    domain.RestaurantsMenu.RestaurantsData[o.Orders[i].RestaurantId-1].Address,
-				OrderId:              ord.OrderId,
-				EstimatedWaitingTime: ord.EstimatedWaitingTime,
-				CreatedTime:          utils.GetCurrentTimeFloat(),
-				RegisteredTime:       ord.RegisteredTime,
-			}
+				order := domain.ClientOrderResponse{
+					RestaurantId:         ord.RestaurantId,
+					RestaurantAddress:    restaurantAddress,
+					OrderId:              ord.OrderId,
+					EstimatedWaitingTime: ord.EstimatedWaitingTime,
+					CreatedTime:          utils.GetCurrentTimeFloat(),
+					RegisteredTime:       ord.RegisteredTime,
+				}
 
-			utils.Log.Info("response created", zap.Any("data", order))
+				utils.Log.Info("Created order for client", zap.Any("order", order))
 
-			orders = append(orders, order)
+				mu.Lock()
+				orders = append(orders, order)
+				mu.Unlock()
+				wg.Done()
+			}(rAddr, toRestaurant)
 		}
+		wg.Wait()
+
 		responseObj := domain.ClientResponse{
 			OrderId: int(oId),
 			Orders:  orders,
 		}
+		utils.Log.Info("Created response object for client", zap.Any("data", responseObj))
 
 		response, err := json.Marshal(responseObj)
 		if err != nil {
 			utils.Log.Fatal("Failed to convert responseOrder to JSON", zap.String("error", err.Error()), zap.Any("responseOrder", responseObj))
 		}
 
-		utils.Log.Info("Send back response order to client", zap.Int("clientId", o.ClientId))
+		utils.Log.Info("Send back response order to client", zap.Int("clientId", o.ClientId), zap.Int("orderId", responseObj.OrderId))
 
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(response)
 	}
 
+	ratingMutex := &sync.Mutex{}
 	rating := func(w http.ResponseWriter, r *http.Request) {
 
 		utils.Log.Info("Requested",
@@ -181,7 +191,80 @@ func StartServer() {
 			return
 		}
 
-		utils.Log.Info("food ordering rating POST")
+		var ratings domain.ClientRating
+		err := json.NewDecoder(r.Body).Decode(&ratings)
+
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			utils.Log.Fatal("Failed to decode client ratings", zap.String("error", err.Error()))
+			return
+		}
+		utils.Log.Info("Client ratings decoded", zap.Any("data", ratings))
+
+		newRatings := make(map[int]float64)
+		var mu = &sync.Mutex{}
+		var wg = &sync.WaitGroup{}
+
+		for i := 0; i < len(ratings.Orders); i++ {
+
+			r := domain.RestaurantsMenu.RestaurantsData[ratings.Orders[i].RestaurantId]
+
+			toRestaurant := domain.RestaurantPayloadRating{
+				OrderId:              ratings.Orders[i].OrderId,
+				Rating:               ratings.Orders[i].Rating,
+				EstimatedWaitingTime: ratings.Orders[i].EstimatedWaitingTime,
+				WaitingTime:          ratings.Orders[i].WaitingTime,
+			}
+			wg.Add(1)
+
+			go func(restaurant domain.RestaurantData, payload domain.RestaurantPayloadRating) {
+
+				utils.Log.Info("Send ratings to restaurant", zap.Any("data", payload))
+
+				body, err := json.Marshal(payload)
+
+				if err != nil {
+					utils.Log.Fatal("Failed to convert restaurant rating to json", zap.String("error", err.Error()), zap.Any("rating", payload))
+				}
+
+				resp, err := http.Post(restaurant.Address+"/v2/rating", "application/json", bytes.NewBuffer(body))
+				if err != nil {
+					utils.Log.Error("Failed to send rating to restaurant"+restaurant.Address, zap.String("error", err.Error()), zap.Any("rating", payload))
+					http.Error(w, "Failed to send rating to restaurant "+restaurant.Address, http.StatusBadRequest)
+				}
+
+				var rating domain.RestaurantResponseRating
+
+				json.NewDecoder(resp.Body).Decode(&rating)
+
+				utils.Log.Info("Decoded Restautant rating response", zap.Any("data", rating))
+
+				mu.Lock()
+
+				newRatings[restaurant.RestaurantId] = rating.RestaurantAvgRating
+
+				mu.Unlock()
+				wg.Done()
+			}(r, toRestaurant)
+		}
+		wg.Wait()
+
+		ratingMutex.Lock()
+		sumRatings := 0.0
+		for i := 1; i <= len(domain.RestaurantsMenu.RestaurantsData); i++ {
+			if entry, ok := newRatings[i]; ok {
+				field := domain.RestaurantsMenu.RestaurantsData[i]
+				field.Rating = entry
+				domain.RestaurantsMenu.RestaurantsData[i] = field
+			}
+			sumRatings += domain.RestaurantsMenu.RestaurantsData[i].Rating
+		}
+
+		avg := sumRatings / float64(domain.RestaurantsMenu.Restaurants)
+
+		utils.LogRep.Info("AVG RATING", zap.Float64("rating", avg))
+		ratingMutex.Unlock()
+
 		w.WriteHeader(http.StatusNoContent)
 	}
 
